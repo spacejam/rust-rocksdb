@@ -12,11 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::{
+    handle::{ConstHandle, Handle},
+    BlockBasedIndexType, BlockBasedOptions, Error, FlushOptions, MemtableFactory, Options,
+    PlainTableFactoryOptions, WriteOptions,
+};
+
 use std::ffi::{CStr, CString};
 use std::mem;
 use std::path::Path;
 
-use libc::{self, c_int, c_uchar, c_uint, c_void, size_t, uint64_t};
+use libc::{self, c_char, c_int, c_uchar, c_uint, c_void, size_t, uint64_t};
 
 use compaction_filter::{self, filter_callback, CompactionFilterCallback, CompactionFilterFn};
 use comparator::{self, ComparatorCallback, CompareFn};
@@ -25,13 +31,182 @@ use merge_operator::{
     self, full_merge_callback, partial_merge_callback, MergeFn, MergeOperatorCallback,
 };
 use slice_transform::SliceTransform;
-use {
-    BlockBasedIndexType, BlockBasedOptions, DBCompactionStyle, DBCompressionType, DBRecoveryMode,
-    FlushOptions, MemtableFactory, Options, PlainTableFactoryOptions, WriteOptions,
-};
 
 pub fn new_cache(capacity: size_t) -> *mut ffi::rocksdb_cache_t {
     unsafe { ffi::rocksdb_cache_create_lru(capacity) }
+}
+
+pub struct ReadOptions {
+    option_fill_cache: Option<bool>,
+    option_set_iterate_upper_bound: Option<Vec<u8>>,
+    option_set_prefix_same_as_start: Option<bool>,
+    option_set_total_order_seek: Option<bool>,
+    option_set_readahead_size: Option<usize>,
+    inner: *mut ffi::rocksdb_readoptions_t,
+}
+
+impl Drop for ReadOptions {
+    fn drop(&mut self) {
+        unsafe { ffi::rocksdb_readoptions_destroy(self.inner) }
+    }
+}
+
+impl Handle<ffi::rocksdb_readoptions_t> for ReadOptions {
+    fn handle(&self) -> *mut ffi::rocksdb_readoptions_t {
+        self.inner
+    }
+}
+
+impl ReadOptions {
+    // TODO add snapshot setting here
+    // TODO add snapshot wrapper structs with proper destructors;
+    // that struct needs an "iterator" impl too.
+    #[allow(dead_code)]
+    fn fill_cache(&mut self, v: bool) {
+        unsafe {
+            ffi::rocksdb_readoptions_set_fill_cache(self.inner, v as c_uchar);
+        }
+        self.option_fill_cache = Some(v);
+    }
+
+    pub(crate) fn set_snapshot<T>(&mut self, snapshot: &T)
+    where
+        T: ConstHandle<ffi::rocksdb_snapshot_t>,
+    {
+        unsafe {
+            ffi::rocksdb_readoptions_set_snapshot(self.inner, snapshot.const_handle());
+        }
+    }
+
+    pub fn set_iterate_upper_bound<K: AsRef<[u8]>>(&mut self, key: K) {
+        self.option_set_iterate_upper_bound = Some(key.as_ref().to_vec());
+        let key = self.option_set_iterate_upper_bound.as_ref().unwrap();
+        unsafe {
+            ffi::rocksdb_readoptions_set_iterate_upper_bound(
+                self.inner,
+                key.as_ptr() as *const c_char,
+                key.len() as size_t,
+            );
+        }
+    }
+
+    pub fn set_prefix_same_as_start(&mut self, v: bool) {
+        unsafe { ffi::rocksdb_readoptions_set_prefix_same_as_start(self.inner, v as c_uchar) }
+        self.option_set_prefix_same_as_start = Some(v);
+    }
+
+    pub fn set_total_order_seek(&mut self, v: bool) {
+        unsafe { ffi::rocksdb_readoptions_set_total_order_seek(self.inner, v as c_uchar) }
+        self.option_set_total_order_seek = Some(v);
+    }
+
+    /// If non-zero, an iterator will create a new table reader which
+    /// performs reads of the given size. Using a large size (> 2MB) can
+    /// improve the performance of forward iteration on spinning disks.
+    /// Default: 0
+    ///
+    /// ```
+    /// use rocksdb::{ReadOptions};
+    ///
+    /// let mut opts = ReadOptions::default();
+    /// opts.set_readahead_size(4_194_304); // 4mb
+    /// ```
+    pub fn set_readahead_size(&mut self, v: usize) {
+        unsafe {
+            ffi::rocksdb_readoptions_set_readahead_size(self.inner, v as size_t);
+        }
+        self.option_set_readahead_size = Some(v);
+    }
+
+    pub(crate) fn input_or_default(
+        input: Option<&ReadOptions>,
+        default_readopts: &mut Option<ReadOptions>,
+    ) -> Result<*mut ffi::rocksdb_readoptions_t, Error> {
+        if input.is_none() && default_readopts.is_none() {
+            default_readopts.replace(ReadOptions::default());
+        }
+
+        let ro_handle = input
+            .or_else(|| default_readopts.as_ref())
+            .ok_or_else(|| Error::new("Unable to extract read options.".to_string()))?
+            .handle();
+
+        if ro_handle.is_null() {
+            return Err(Error::new(
+                "Unable to create RocksDB read options. \
+                 This is a fairly trivial call, and its \
+                 failure may be indicative of a \
+                 mis-compiled or mis-loaded RocksDB \
+                 library."
+                    .to_string(),
+            ));
+        }
+
+        Ok(ro_handle)
+    }
+}
+
+impl Default for ReadOptions {
+    fn default() -> ReadOptions {
+        unsafe {
+            ReadOptions {
+                option_fill_cache: None,
+                option_set_iterate_upper_bound: None,
+                option_set_prefix_same_as_start: None,
+                option_set_total_order_seek: None,
+                option_set_readahead_size: None,
+                inner: ffi::rocksdb_readoptions_create(),
+            }
+        }
+    }
+}
+
+impl Clone for ReadOptions {
+    fn clone(&self) -> ReadOptions {
+        let mut ops = ReadOptions::default();
+        if let Some(fill_cache) = self.option_fill_cache {
+            ops.fill_cache(fill_cache);
+        };
+        if let Some(set_iterate_upper_bound) = &self.option_set_iterate_upper_bound {
+            ops.set_iterate_upper_bound(set_iterate_upper_bound);
+        };
+        if let Some(set_prefix_same_as_start) = self.option_set_prefix_same_as_start {
+            ops.set_prefix_same_as_start(set_prefix_same_as_start);
+        };
+        if let Some(set_total_order_seek) = self.option_set_total_order_seek {
+            ops.set_total_order_seek(set_total_order_seek);
+        };
+        if let Some(set_readahead_size) = self.option_set_readahead_size {
+            ops.set_readahead_size(set_readahead_size)
+        };
+        ops
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum DBCompressionType {
+    None = ffi::rocksdb_no_compression as isize,
+    Snappy = ffi::rocksdb_snappy_compression as isize,
+    Zlib = ffi::rocksdb_zlib_compression as isize,
+    Bz2 = ffi::rocksdb_bz2_compression as isize,
+    Lz4 = ffi::rocksdb_lz4_compression as isize,
+    Lz4hc = ffi::rocksdb_lz4hc_compression as isize,
+    Zstd = ffi::rocksdb_zstd_compression as isize,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum DBCompactionStyle {
+    Level = ffi::rocksdb_level_compaction as isize,
+    Universal = ffi::rocksdb_universal_compaction as isize,
+    Fifo = ffi::rocksdb_fifo_compaction as isize,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum DBRecoveryMode {
+    TolerateCorruptedTailRecords = ffi::rocksdb_tolerate_corrupted_tail_records_recovery as isize,
+    AbsoluteConsistency = ffi::rocksdb_absolute_consistency_recovery as isize,
+    PointInTime = ffi::rocksdb_point_in_time_recovery as isize,
+    SkipAnyCorruptedRecord = ffi::rocksdb_skip_any_corrupted_records_recovery as isize,
 }
 
 unsafe impl Send for Options {}
@@ -65,6 +240,12 @@ impl Drop for WriteOptions {
         unsafe {
             ffi::rocksdb_writeoptions_destroy(self.inner);
         }
+    }
+}
+
+impl Handle<ffi::rocksdb_writeoptions_t> for WriteOptions {
+    fn handle(&self) -> *mut ffi::rocksdb_writeoptions_t {
+        self.inner
     }
 }
 
@@ -1283,13 +1464,31 @@ impl WriteOptions {
     pub fn set_sync(&mut self, sync: bool) {
         unsafe {
             ffi::rocksdb_writeoptions_set_sync(self.inner, sync as c_uchar);
-        }
+        };
+        self.option_set_sync = Some(sync);
     }
 
     pub fn disable_wal(&mut self, disable: bool) {
         unsafe {
             ffi::rocksdb_writeoptions_disable_WAL(self.inner, disable as c_int);
         }
+        self.option_disable_wal = Some(disable);
+    }
+
+    pub(crate) fn input_or_default(
+        input: Option<&WriteOptions>,
+        default_writeopts: &mut Option<WriteOptions>,
+    ) -> Result<*mut ffi::rocksdb_writeoptions_t, Error> {
+        if default_writeopts.is_none() {
+            default_writeopts.replace(WriteOptions::default());
+        }
+
+        let wo_handle = input
+            .or_else(|| default_writeopts.as_ref())
+            .ok_or_else(|| Error::new("Unable to extract write options.".to_string()))?
+            .handle();
+
+        Ok(wo_handle)
     }
 }
 
@@ -1299,7 +1498,24 @@ impl Default for WriteOptions {
         if write_opts.is_null() {
             panic!("Could not create RocksDB write options");
         }
-        WriteOptions { inner: write_opts }
+        WriteOptions {
+            option_set_sync: None,
+            option_disable_wal: None,
+            inner: write_opts,
+        }
+    }
+}
+
+impl Clone for WriteOptions {
+    fn clone(&self) -> WriteOptions {
+        let mut ops = WriteOptions::default();
+        if let Some(set_sync) = self.option_set_sync {
+            ops.set_sync(set_sync);
+        };
+        if let Some(disable_wal) = self.option_disable_wal {
+            ops.disable_wal(disable_wal);
+        };
+        ops
     }
 }
 
@@ -1329,5 +1545,11 @@ mod tests {
             height: 4,
             branching_factor: 4,
         });
+    }
+}
+
+impl ConstHandle<ffi::rocksdb_options_t> for Options {
+    fn const_handle(&self) -> *const ffi::rocksdb_options_t {
+        self.inner
     }
 }

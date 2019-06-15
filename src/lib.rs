@@ -18,28 +18,35 @@
 //! # Examples
 //!
 //! ```
-//! use rocksdb::{DB, Options};
+//! use rocksdb::prelude::*;
+//! # use rocksdb::TemporaryDBPath;
 //! // NB: db is automatically closed at end of lifetime
+//!
 //! let path = "_path_for_rocksdb_storage";
-//! {
-//!    let db = DB::open_default(path).unwrap();
-//!    db.put(b"my key", b"my value").unwrap();
-//!    match db.get(b"my key") {
-//!        Ok(Some(value)) => println!("retrieved value {}", value.to_utf8().unwrap()),
-//!        Ok(None) => println!("value not found"),
-//!        Err(e) => println!("operational problem encountered: {}", e),
-//!    }
-//!    db.delete(b"my key").unwrap();
+//! # let path = TemporaryDBPath::new();
+//! # {
+//!
+//! let db = DB::open_default(&path).unwrap();
+//! db.put(b"my key", b"my value").unwrap();
+//! match db.get(b"my key") {
+//!     Ok(Some(value)) => println!("retrieved value {}", value.to_utf8().unwrap()),
+//!     Ok(None) => println!("value not found"),
+//!     Err(e) => println!("operational problem encountered: {}", e),
 //! }
-//! let _ = DB::destroy(&Options::default(), path);
+//! db.delete(b"my key").unwrap();
+
+//! # }
 //! ```
 //!
 //! Opening a database and a single column family with custom options:
 //!
 //! ```
-//! use rocksdb::{DB, ColumnFamilyDescriptor, Options};
+//! use rocksdb::{prelude::*, ColumnFamilyDescriptor};
+//! # use rocksdb::TemporaryDBPath;
 //!
 //! let path = "_path_for_rocksdb_storage_with_cfs";
+//! # let path = TemporaryDBPath::new();
+//!
 //! let mut cf_opts = Options::default();
 //! cf_opts.set_max_write_buffer_number(16);
 //! let cf = ColumnFamilyDescriptor::new("cf1", cf_opts);
@@ -47,10 +54,9 @@
 //! let mut db_opts = Options::default();
 //! db_opts.create_missing_column_families(true);
 //! db_opts.create_if_missing(true);
-//! {
-//!     let db = DB::open_cf_descriptors(&db_opts, path, vec![cf]).unwrap();
-//! }
-//! let _ = DB::destroy(&db_opts, path);
+//! # {
+//! let db = DB::open_cf_descriptors(&db_opts, &path, vec![cf]).unwrap();
+//! # }
 //! ```
 //!
 
@@ -59,48 +65,53 @@ extern crate librocksdb_sys as ffi;
 
 #[macro_use]
 mod ffi_util;
+mod util;
 
 pub mod backup;
 pub mod checkpoint;
+pub mod column_family;
 pub mod compaction_filter;
 mod comparator;
 mod db;
+mod db_iterator;
 mod db_options;
+mod db_pinnable_slice;
+mod db_vector;
+mod handle;
 pub mod merge_operator;
+mod open_raw;
+pub mod ops;
+mod optimistic_transaction_db;
+mod read_only_db;
 mod slice_transform;
+mod snapshot;
+mod transaction;
+mod transaction_db;
+mod write_batch;
 
+pub mod prelude;
+
+pub use column_family::ColumnFamilyDescriptor;
 pub use compaction_filter::Decision as CompactionDecision;
-pub use db::{
-    DBCompactionStyle, DBCompressionType, DBIterator, DBPinnableSlice, DBRawIterator,
-    DBRecoveryMode, DBVector, Direction, IteratorMode, ReadOptions, Snapshot, WriteBatch,
-};
+pub use db::DB;
+pub use db_iterator::{DBIterator, DBRawIterator, Direction, IteratorMode};
+pub use db_options::{DBCompactionStyle, DBCompressionType, DBRecoveryMode, ReadOptions};
+pub use db_pinnable_slice::DBPinnableSlice;
+pub use db_vector::DBVector;
+pub use read_only_db::ReadOnlyDB;
+pub use snapshot::Snapshot;
+pub use util::TemporaryDBPath;
+pub use write_batch::WriteBatch;
 
 pub use slice_transform::SliceTransform;
 
 pub use merge_operator::MergeOperands;
-use std::collections::BTreeMap;
 use std::error;
 use std::fmt;
-use std::marker::PhantomData;
-use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
 
-/// A RocksDB database.
-///
-/// See crate level documentation for a simple usage example.
-pub struct DB {
-    inner: *mut ffi::rocksdb_t,
-    cfs: Arc<RwLock<BTreeMap<String, *mut ffi::rocksdb_column_family_handle_t>>>,
-    path: PathBuf,
-}
-
-/// A descriptor for a RocksDB column family.
-///
-/// A description of the column family, containing the name and `Options`.
-pub struct ColumnFamilyDescriptor {
-    name: String,
-    options: Options,
-}
+pub use optimistic_transaction_db::{OptimisticTransactionDB, OptimisticTransactionOptions};
+pub use transaction::Transaction;
+pub use transaction_db::{TransactionDB, TransactionDBOptions, TransactionOptions};
 
 /// A simple wrapper round a string, used for errors reported from
 /// ffi calls.
@@ -198,7 +209,7 @@ pub struct PlainTableFactoryOptions {
 /// # Examples
 ///
 /// ```
-/// use rocksdb::{Options, DB};
+/// use rocksdb::{Options, DB, prelude::*};
 /// use rocksdb::DBCompactionStyle;
 ///
 /// fn badly_tuned_for_somebody_elses_disk() -> DB {
@@ -235,10 +246,11 @@ pub struct Options {
 /// Manually flushing the memtable:
 ///
 /// ```
-/// use rocksdb::{DB, Options, FlushOptions};
+/// use rocksdb::{DB, Options, FlushOptions, prelude::*};
 ///
 /// let path = "_path_for_rocksdb_storageY";
 /// {
+///
 ///     let db = DB::open_default(path).unwrap();
 ///
 ///     let mut flush_options = FlushOptions::default();
@@ -246,6 +258,7 @@ pub struct Options {
 ///
 ///     db.flush_opt(&flush_options);
 /// }
+///
 /// let _ = DB::destroy(&Options::default(), path);
 /// ```
 pub struct FlushOptions {
@@ -259,9 +272,9 @@ pub struct FlushOptions {
 /// Making an unsafe write of a batch:
 ///
 /// ```
-/// use rocksdb::{DB, Options, WriteBatch, WriteOptions};
+/// use rocksdb::{DB, Options, WriteBatch, WriteOptions, prelude::*};
 ///
-/// let path = "_path_for_rocksdb_storageY";
+/// let path = "_path_for_rocksdb_storageZ";
 /// {
 ///     let db = DB::open_default(path).unwrap();
 ///     let mut batch = WriteBatch::default();
@@ -278,15 +291,15 @@ pub struct FlushOptions {
 /// let _ = DB::destroy(&Options::default(), path);
 /// ```
 pub struct WriteOptions {
+    option_set_sync: Option<bool>,
+    option_disable_wal: Option<bool>,
     inner: *mut ffi::rocksdb_writeoptions_t,
 }
 
 /// An opaque type used to represent a column family. Returned from some functions, and used
 /// in others
-#[derive(Copy, Clone)]
-pub struct ColumnFamily<'a> {
+pub struct ColumnFamily {
     inner: *mut ffi::rocksdb_column_family_handle_t,
-    db: PhantomData<&'a DB>,
 }
 
-unsafe impl<'a> Send for ColumnFamily<'a> {}
+unsafe impl Send for ColumnFamily {}
