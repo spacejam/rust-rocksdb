@@ -15,14 +15,37 @@
 
 use crate::{
     ffi,
-    ffi_util::{from_cstr, opt_bytes_to_ptr, raw_data, to_cpath},
+    ffi_util::{from_cstr, raw_data, to_cpath},
+    handle::Handle,
+    ops::{
+        backup::BackupInternal,
+        checkpoint::CheckpointInternal,
+        column_family::{CreateColumnFamily, DropColumnFamily, GetColumnFamily},
+        compact_range::{CompactRangeCFOpt, CompactRangeOpt},
+        delete::{DeleteCFOpt, DeleteOpt},
+        delete_file_in_range::{DeleteFileInRange, DeleteFileInRangeCF},
+        delete_range::DeleteRangeCFOpt,
+        flush::{FlushCFOpt, FlushOpt},
+        get_pinned::{GetPinnedCFOpt, GetPinnedOpt},
+        ingest_external_file::{IngestExternalFileCFOpt, IngestExternalFileOpt},
+        iterate::{Iterate, IterateCF},
+        merge::{MergeCFOpt, MergeOpt},
+        multi_get::{MultiGetCFOpt, MultiGetOpt},
+        perf::PerfInternal,
+        property::{GetProperty, GetPropertyCF},
+        put::{PutCFOpt, PutOpt},
+        set_options::{SetOptions, SetOptionsCF},
+        snapshot::SnapshotInternal,
+        write_batch::WriteBatchWriteOpt,
+        GetColumnFamilies,
+    },
     ColumnFamily, ColumnFamilyDescriptor, CompactOptions, DBIterator, DBPinnableSlice,
-    DBRawIterator, DBWALIterator, Direction, Error, FlushOptions, IngestExternalFileOptions,
-    IteratorMode, Options, ReadOptions, Snapshot, WriteBatch, WriteOptions,
-    DEFAULT_COLUMN_FAMILY_NAME,
+    DBRawIterator, DBWALIterator, Error, FlushOptions, IngestExternalFileOptions, IteratorMode,
+    Options, ReadOptions, Snapshot, WriteBatch, WriteOptions, DEFAULT_COLUMN_FAMILY_NAME,
 };
 
-use libc::{self, c_char, c_int, c_uchar, c_void, size_t};
+use ambassador::Delegate;
+use libc::{self, c_char, c_int, c_uchar};
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
 use std::fmt;
@@ -31,13 +54,12 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::ptr;
 use std::slice;
-use std::str;
 use std::time::Duration;
 
 /// A RocksDB database.
 ///
 /// See crate level documentation for a simple usage example.
-pub struct DB {
+pub struct DBInner {
     pub(crate) inner: *mut ffi::rocksdb_t,
     cfs: BTreeMap<String, ColumnFamily>,
     path: PathBuf,
@@ -46,11 +68,17 @@ pub struct DB {
 // Safety note: auto-implementing Send on most db-related types is prevented by the inner FFI
 // pointer. In most cases, however, this pointer is Send-safe because it is never aliased and
 // rocksdb internally does not rely on thread-local information for its user-exposed types.
-unsafe impl Send for DB {}
+unsafe impl Send for DBInner {}
 
 // Sync is similarly safe for many types because they do not expose interior mutability, and their
 // use within the rocksdb library is generally behind a const reference
-unsafe impl Sync for DB {}
+unsafe impl Sync for DBInner {}
+
+impl Handle<ffi::rocksdb_t> for DBInner {
+    fn handle(&self) -> *mut ffi::rocksdb_t {
+        self.inner
+    }
+}
 
 // Specifies whether open DB for read only.
 enum AccessType<'a> {
@@ -60,140 +88,14 @@ enum AccessType<'a> {
     WithTTL { ttl: Duration },
 }
 
-impl DB {
-    /// Opens a database with default options.
-    pub fn open_default<P: AsRef<Path>>(path: P) -> Result<DB, Error> {
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
-        DB::open(&opts, path)
-    }
-
-    /// Opens the database with the specified options.
-    pub fn open<P: AsRef<Path>>(opts: &Options, path: P) -> Result<DB, Error> {
-        DB::open_cf(opts, path, None::<&str>)
-    }
-
-    /// Opens the database for read only with the specified options.
-    pub fn open_for_read_only<P: AsRef<Path>>(
-        opts: &Options,
-        path: P,
-        error_if_log_file_exist: bool,
-    ) -> Result<DB, Error> {
-        DB::open_cf_for_read_only(opts, path, None::<&str>, error_if_log_file_exist)
-    }
-
-    /// Opens the database as a secondary.
-    pub fn open_as_secondary<P: AsRef<Path>>(
-        opts: &Options,
-        primary_path: P,
-        secondary_path: P,
-    ) -> Result<DB, Error> {
-        DB::open_cf_as_secondary(opts, primary_path, secondary_path, None::<&str>)
-    }
-
-    /// Opens the database with a Time to Live compaction filter.
-    pub fn open_with_ttl<P: AsRef<Path>>(
-        opts: &Options,
-        path: P,
-        ttl: Duration,
-    ) -> Result<DB, Error> {
-        let c_path = to_cpath(&path)?;
-        let db = DB::open_raw(opts, &c_path, &AccessType::WithTTL { ttl })?;
-        if db.is_null() {
-            return Err(Error::new("Could not initialize database.".to_owned()));
-        }
-
-        Ok(DB {
-            inner: db,
-            cfs: BTreeMap::new(),
-            path: path.as_ref().to_path_buf(),
-        })
-    }
-
-    /// Opens a database with the given database options and column family names.
-    ///
-    /// Column families opened using this function will be created with default `Options`.
-    pub fn open_cf<P, I, N>(opts: &Options, path: P, cfs: I) -> Result<DB, Error>
-    where
-        P: AsRef<Path>,
-        I: IntoIterator<Item = N>,
-        N: AsRef<str>,
-    {
-        let cfs = cfs
-            .into_iter()
-            .map(|name| ColumnFamilyDescriptor::new(name.as_ref(), Options::default()));
-
-        DB::open_cf_descriptors_internal(opts, path, cfs, &AccessType::ReadWrite)
-    }
-
-    /// Opens a database for read only with the given database options and column family names.
-    pub fn open_cf_for_read_only<P, I, N>(
-        opts: &Options,
-        path: P,
-        cfs: I,
-        error_if_log_file_exist: bool,
-    ) -> Result<DB, Error>
-    where
-        P: AsRef<Path>,
-        I: IntoIterator<Item = N>,
-        N: AsRef<str>,
-    {
-        let cfs = cfs
-            .into_iter()
-            .map(|name| ColumnFamilyDescriptor::new(name.as_ref(), Options::default()));
-
-        DB::open_cf_descriptors_internal(
-            opts,
-            path,
-            cfs,
-            &AccessType::ReadOnly {
-                error_if_log_file_exist,
-            },
-        )
-    }
-
-    /// Opens the database as a secondary with the given database options and column family names.
-    pub fn open_cf_as_secondary<P, I, N>(
-        opts: &Options,
-        primary_path: P,
-        secondary_path: P,
-        cfs: I,
-    ) -> Result<DB, Error>
-    where
-        P: AsRef<Path>,
-        I: IntoIterator<Item = N>,
-        N: AsRef<str>,
-    {
-        let cfs = cfs
-            .into_iter()
-            .map(|name| ColumnFamilyDescriptor::new(name.as_ref(), Options::default()));
-
-        DB::open_cf_descriptors_internal(
-            opts,
-            primary_path,
-            cfs,
-            &AccessType::Secondary {
-                secondary_path: secondary_path.as_ref(),
-            },
-        )
-    }
-
-    /// Opens a database with the given database options and column family descriptors.
-    pub fn open_cf_descriptors<P, I>(opts: &Options, path: P, cfs: I) -> Result<DB, Error>
-    where
-        P: AsRef<Path>,
-        I: IntoIterator<Item = ColumnFamilyDescriptor>,
-    {
-        DB::open_cf_descriptors_internal(opts, path, cfs, &AccessType::ReadWrite)
-    }
-
+impl DBInner {
     /// Internal implementation for opening RocksDB.
     fn open_cf_descriptors_internal<P, I>(
         opts: &Options,
         path: P,
         cfs: I,
         access_type: &AccessType,
-    ) -> Result<DB, Error>
+    ) -> Result<Self, Error>
     where
         P: AsRef<Path>,
         I: IntoIterator<Item = ColumnFamilyDescriptor>,
@@ -213,7 +115,7 @@ impl DB {
         let mut cf_map = BTreeMap::new();
 
         if cfs.is_empty() {
-            db = DB::open_raw(opts, &cpath, access_type)?;
+            db = Self::open_raw(opts, &cpath, access_type)?;
         } else {
             let mut cfs_v = cfs;
             // Always open the default column family.
@@ -240,7 +142,7 @@ impl DB {
                 .map(|cf| cf.options.inner as *const _)
                 .collect();
 
-            db = DB::open_cf_raw(
+            db = Self::open_cf_raw(
                 opts,
                 &cpath,
                 &cfs_v,
@@ -266,7 +168,7 @@ impl DB {
             return Err(Error::new("Could not initialize database.".to_owned()));
         }
 
-        Ok(DB {
+        Ok(Self {
             inner: db,
             cfs: cf_map,
             path: path.as_ref().to_path_buf(),
@@ -354,903 +256,8 @@ impl DB {
         Ok(db)
     }
 
-    pub fn list_cf<P: AsRef<Path>>(opts: &Options, path: P) -> Result<Vec<String>, Error> {
-        let cpath = to_cpath(path)?;
-        let mut length = 0;
-
-        unsafe {
-            let ptr = ffi_try!(ffi::rocksdb_list_column_families(
-                opts.inner,
-                cpath.as_ptr() as *const _,
-                &mut length,
-            ));
-
-            let vec = slice::from_raw_parts(ptr, length)
-                .iter()
-                .map(|ptr| CStr::from_ptr(*ptr).to_string_lossy().into_owned())
-                .collect();
-            ffi::rocksdb_list_column_families_destroy(ptr, length);
-            Ok(vec)
-        }
-    }
-
-    pub fn destroy<P: AsRef<Path>>(opts: &Options, path: P) -> Result<(), Error> {
-        let cpath = to_cpath(path)?;
-        unsafe {
-            ffi_try!(ffi::rocksdb_destroy_db(opts.inner, cpath.as_ptr()));
-        }
-        Ok(())
-    }
-
-    pub fn repair<P: AsRef<Path>>(opts: &Options, path: P) -> Result<(), Error> {
-        let cpath = to_cpath(path)?;
-        unsafe {
-            ffi_try!(ffi::rocksdb_repair_db(opts.inner, cpath.as_ptr()));
-        }
-        Ok(())
-    }
-
     pub fn path(&self) -> &Path {
         &self.path.as_path()
-    }
-
-    /// Flushes database memtables to SST files on the disk.
-    pub fn flush_opt(&self, flushopts: &FlushOptions) -> Result<(), Error> {
-        unsafe {
-            ffi_try!(ffi::rocksdb_flush(self.inner, flushopts.inner));
-        }
-        Ok(())
-    }
-
-    /// Flushes database memtables to SST files on the disk using default options.
-    pub fn flush(&self) -> Result<(), Error> {
-        self.flush_opt(&FlushOptions::default())
-    }
-
-    /// Flushes database memtables to SST files on the disk for a given column family.
-    pub fn flush_cf_opt(&self, cf: &ColumnFamily, flushopts: &FlushOptions) -> Result<(), Error> {
-        unsafe {
-            ffi_try!(ffi::rocksdb_flush_cf(self.inner, flushopts.inner, cf.inner));
-        }
-        Ok(())
-    }
-
-    /// Flushes database memtables to SST files on the disk for a given column family using default
-    /// options.
-    pub fn flush_cf(&self, cf: &ColumnFamily) -> Result<(), Error> {
-        self.flush_cf_opt(cf, &FlushOptions::default())
-    }
-
-    pub fn write_opt(&self, batch: WriteBatch, writeopts: &WriteOptions) -> Result<(), Error> {
-        unsafe {
-            ffi_try!(ffi::rocksdb_write(self.inner, writeopts.inner, batch.inner));
-        }
-        Ok(())
-    }
-
-    pub fn write(&self, batch: WriteBatch) -> Result<(), Error> {
-        self.write_opt(batch, &WriteOptions::default())
-    }
-
-    pub fn write_without_wal(&self, batch: WriteBatch) -> Result<(), Error> {
-        let mut wo = WriteOptions::new();
-        wo.disable_wal(true);
-        self.write_opt(batch, &wo)
-    }
-
-    /// Return the bytes associated with a key value with read options. If you only intend to use
-    /// the vector returned temporarily, consider using [`get_pinned_opt`](#method.get_pinned_opt)
-    /// to avoid unnecessary memory copy.
-    pub fn get_opt<K: AsRef<[u8]>>(
-        &self,
-        key: K,
-        readopts: &ReadOptions,
-    ) -> Result<Option<Vec<u8>>, Error> {
-        self.get_pinned_opt(key, readopts)
-            .map(|x| x.map(|v| v.as_ref().to_vec()))
-    }
-
-    /// Return the bytes associated with a key value. If you only intend to use the vector returned
-    /// temporarily, consider using [`get_pinned`](#method.get_pinned) to avoid unnecessary memory
-    /// copy.
-    pub fn get<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<Vec<u8>>, Error> {
-        self.get_opt(key.as_ref(), &ReadOptions::default())
-    }
-
-    /// Return the bytes associated with a key value and the given column family with read options.
-    /// If you only intend to use the vector returned temporarily, consider using
-    /// [`get_pinned_cf_opt`](#method.get_pinned_cf_opt) to avoid unnecessary memory.
-    pub fn get_cf_opt<K: AsRef<[u8]>>(
-        &self,
-        cf: &ColumnFamily,
-        key: K,
-        readopts: &ReadOptions,
-    ) -> Result<Option<Vec<u8>>, Error> {
-        self.get_pinned_cf_opt(cf, key, readopts)
-            .map(|x| x.map(|v| v.as_ref().to_vec()))
-    }
-
-    /// Return the bytes associated with a key value and the given column family. If you only
-    /// intend to use the vector returned temporarily, consider using
-    /// [`get_pinned_cf`](#method.get_pinned_cf) to avoid unnecessary memory.
-    pub fn get_cf<K: AsRef<[u8]>>(
-        &self,
-        cf: &ColumnFamily,
-        key: K,
-    ) -> Result<Option<Vec<u8>>, Error> {
-        self.get_cf_opt(cf, key.as_ref(), &ReadOptions::default())
-    }
-
-    /// Return the value associated with a key using RocksDB's PinnableSlice
-    /// so as to avoid unnecessary memory copy.
-    pub fn get_pinned_opt<K: AsRef<[u8]>>(
-        &self,
-        key: K,
-        readopts: &ReadOptions,
-    ) -> Result<Option<DBPinnableSlice>, Error> {
-        if readopts.inner.is_null() {
-            return Err(Error::new(
-                "Unable to create RocksDB read options. This is a fairly trivial call, and its \
-                 failure may be indicative of a mis-compiled or mis-loaded RocksDB library."
-                    .to_owned(),
-            ));
-        }
-
-        let key = key.as_ref();
-        unsafe {
-            let val = ffi_try!(ffi::rocksdb_get_pinned(
-                self.inner,
-                readopts.inner,
-                key.as_ptr() as *const c_char,
-                key.len() as size_t,
-            ));
-            if val.is_null() {
-                Ok(None)
-            } else {
-                Ok(Some(DBPinnableSlice::from_c(val)))
-            }
-        }
-    }
-
-    /// Return the value associated with a key using RocksDB's PinnableSlice
-    /// so as to avoid unnecessary memory copy. Similar to get_pinned_opt but
-    /// leverages default options.
-    pub fn get_pinned<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<DBPinnableSlice>, Error> {
-        self.get_pinned_opt(key, &ReadOptions::default())
-    }
-
-    /// Return the value associated with a key using RocksDB's PinnableSlice
-    /// so as to avoid unnecessary memory copy. Similar to get_pinned_opt but
-    /// allows specifying ColumnFamily
-    pub fn get_pinned_cf_opt<K: AsRef<[u8]>>(
-        &self,
-        cf: &ColumnFamily,
-        key: K,
-        readopts: &ReadOptions,
-    ) -> Result<Option<DBPinnableSlice>, Error> {
-        if readopts.inner.is_null() {
-            return Err(Error::new(
-                "Unable to create RocksDB read options. This is a fairly trivial call, and its \
-                 failure may be indicative of a mis-compiled or mis-loaded RocksDB library."
-                    .to_owned(),
-            ));
-        }
-
-        let key = key.as_ref();
-        unsafe {
-            let val = ffi_try!(ffi::rocksdb_get_pinned_cf(
-                self.inner,
-                readopts.inner,
-                cf.inner,
-                key.as_ptr() as *const c_char,
-                key.len() as size_t,
-            ));
-            if val.is_null() {
-                Ok(None)
-            } else {
-                Ok(Some(DBPinnableSlice::from_c(val)))
-            }
-        }
-    }
-
-    /// Return the value associated with a key using RocksDB's PinnableSlice
-    /// so as to avoid unnecessary memory copy. Similar to get_pinned_cf_opt but
-    /// leverages default options.
-    pub fn get_pinned_cf<K: AsRef<[u8]>>(
-        &self,
-        cf: &ColumnFamily,
-        key: K,
-    ) -> Result<Option<DBPinnableSlice>, Error> {
-        self.get_pinned_cf_opt(cf, key, &ReadOptions::default())
-    }
-
-    /// Return the values associated with the given keys.
-    pub fn multi_get<K, I>(&self, keys: I) -> Result<Vec<Vec<u8>>, Error>
-    where
-        K: AsRef<[u8]>,
-        I: IntoIterator<Item = K>,
-    {
-        self.multi_get_opt(keys, &ReadOptions::default())
-    }
-
-    /// Return the values associated with the given keys using read options.
-    pub fn multi_get_opt<K, I>(
-        &self,
-        keys: I,
-        readopts: &ReadOptions,
-    ) -> Result<Vec<Vec<u8>>, Error>
-    where
-        K: AsRef<[u8]>,
-        I: IntoIterator<Item = K>,
-    {
-        let (keys, keys_sizes): (Vec<Box<[u8]>>, Vec<_>) = keys
-            .into_iter()
-            .map(|k| (Box::from(k.as_ref()), k.as_ref().len()))
-            .unzip();
-        let ptr_keys: Vec<_> = keys.iter().map(|k| k.as_ptr() as *const c_char).collect();
-
-        let mut values = vec![ptr::null_mut(); keys.len()];
-        let mut values_sizes = vec![0_usize; keys.len()];
-        unsafe {
-            ffi_try!(ffi::rocksdb_multi_get(
-                self.inner,
-                readopts.inner,
-                ptr_keys.len(),
-                ptr_keys.as_ptr(),
-                keys_sizes.as_ptr(),
-                values.as_mut_ptr(),
-                values_sizes.as_mut_ptr(),
-            ));
-        }
-
-        Ok(convert_values(values, values_sizes))
-    }
-
-    /// Return the values associated with the given keys and column families.
-    pub fn multi_get_cf<'c, K, I>(&self, keys: I) -> Result<Vec<Vec<u8>>, Error>
-    where
-        K: AsRef<[u8]>,
-        I: IntoIterator<Item = (&'c ColumnFamily, K)>,
-    {
-        self.multi_get_cf_opt(keys, &ReadOptions::default())
-    }
-
-    /// Return the values associated with the given keys and column families using read options.
-    pub fn multi_get_cf_opt<'c, K, I>(
-        &self,
-        keys: I,
-        readopts: &ReadOptions,
-    ) -> Result<Vec<Vec<u8>>, Error>
-    where
-        K: AsRef<[u8]>,
-        I: IntoIterator<Item = (&'c ColumnFamily, K)>,
-    {
-        let mut boxed_keys: Vec<Box<[u8]>> = Vec::new();
-        let mut keys_sizes = Vec::new();
-        let mut column_families = Vec::new();
-        for (cf, key) in keys {
-            boxed_keys.push(Box::from(key.as_ref()));
-            keys_sizes.push(key.as_ref().len());
-            column_families.push(cf);
-        }
-        let ptr_keys: Vec<_> = boxed_keys
-            .iter()
-            .map(|k| k.as_ptr() as *const c_char)
-            .collect();
-        let ptr_cfs: Vec<_> = column_families
-            .iter()
-            .map(|c| c.inner as *const _)
-            .collect();
-
-        let mut values = vec![ptr::null_mut(); boxed_keys.len()];
-        let mut values_sizes = vec![0_usize; boxed_keys.len()];
-        unsafe {
-            ffi_try!(ffi::rocksdb_multi_get_cf(
-                self.inner,
-                readopts.inner,
-                ptr_cfs.as_ptr(),
-                ptr_keys.len(),
-                ptr_keys.as_ptr(),
-                keys_sizes.as_ptr(),
-                values.as_mut_ptr(),
-                values_sizes.as_mut_ptr(),
-            ));
-        }
-
-        Ok(convert_values(values, values_sizes))
-    }
-
-    pub fn create_cf<N: AsRef<str>>(&mut self, name: N, opts: &Options) -> Result<(), Error> {
-        let cf_name = if let Ok(c) = CString::new(name.as_ref().as_bytes()) {
-            c
-        } else {
-            return Err(Error::new(
-                "Failed to convert path to CString when creating cf".to_owned(),
-            ));
-        };
-        unsafe {
-            let inner = ffi_try!(ffi::rocksdb_create_column_family(
-                self.inner,
-                opts.inner,
-                cf_name.as_ptr(),
-            ));
-
-            self.cfs
-                .insert(name.as_ref().to_string(), ColumnFamily { inner });
-        };
-        Ok(())
-    }
-
-    pub fn drop_cf(&mut self, name: &str) -> Result<(), Error> {
-        if let Some(cf) = self.cfs.remove(name) {
-            unsafe {
-                ffi_try!(ffi::rocksdb_drop_column_family(self.inner, cf.inner));
-            }
-            Ok(())
-        } else {
-            Err(Error::new(format!("Invalid column family: {}", name)))
-        }
-    }
-
-    /// Return the underlying column family handle.
-    pub fn cf_handle(&self, name: &str) -> Option<&ColumnFamily> {
-        self.cfs.get(name)
-    }
-
-    pub fn iterator<'a: 'b, 'b>(&'a self, mode: IteratorMode) -> DBIterator<'b> {
-        let readopts = ReadOptions::default();
-        self.iterator_opt(mode, readopts)
-    }
-
-    pub fn iterator_opt<'a: 'b, 'b>(
-        &'a self,
-        mode: IteratorMode,
-        readopts: ReadOptions,
-    ) -> DBIterator<'b> {
-        DBIterator::new(self, readopts, mode)
-    }
-
-    /// Opens an iterator using the provided ReadOptions.
-    /// This is used when you want to iterate over a specific ColumnFamily with a modified ReadOptions
-    pub fn iterator_cf_opt<'a: 'b, 'b>(
-        &'a self,
-        cf_handle: &ColumnFamily,
-        readopts: ReadOptions,
-        mode: IteratorMode,
-    ) -> DBIterator<'b> {
-        DBIterator::new_cf(self, cf_handle, readopts, mode)
-    }
-
-    /// Opens an iterator with `set_total_order_seek` enabled.
-    /// This must be used to iterate across prefixes when `set_memtable_factory` has been called
-    /// with a Hash-based implementation.
-    pub fn full_iterator<'a: 'b, 'b>(&'a self, mode: IteratorMode) -> DBIterator<'b> {
-        let mut opts = ReadOptions::default();
-        opts.set_total_order_seek(true);
-        DBIterator::new(self, opts, mode)
-    }
-
-    pub fn prefix_iterator<'a: 'b, 'b, P: AsRef<[u8]>>(&'a self, prefix: P) -> DBIterator<'b> {
-        let mut opts = ReadOptions::default();
-        opts.set_prefix_same_as_start(true);
-        DBIterator::new(
-            self,
-            opts,
-            IteratorMode::From(prefix.as_ref(), Direction::Forward),
-        )
-    }
-
-    pub fn iterator_cf<'a: 'b, 'b>(
-        &'a self,
-        cf_handle: &ColumnFamily,
-        mode: IteratorMode,
-    ) -> DBIterator<'b> {
-        let opts = ReadOptions::default();
-        DBIterator::new_cf(self, cf_handle, opts, mode)
-    }
-
-    pub fn full_iterator_cf<'a: 'b, 'b>(
-        &'a self,
-        cf_handle: &ColumnFamily,
-        mode: IteratorMode,
-    ) -> DBIterator<'b> {
-        let mut opts = ReadOptions::default();
-        opts.set_total_order_seek(true);
-        DBIterator::new_cf(self, cf_handle, opts, mode)
-    }
-
-    pub fn prefix_iterator_cf<'a: 'b, 'b, P: AsRef<[u8]>>(
-        &'a self,
-        cf_handle: &ColumnFamily,
-        prefix: P,
-    ) -> DBIterator<'b> {
-        let mut opts = ReadOptions::default();
-        opts.set_prefix_same_as_start(true);
-        DBIterator::new_cf(
-            self,
-            cf_handle,
-            opts,
-            IteratorMode::From(prefix.as_ref(), Direction::Forward),
-        )
-    }
-
-    /// Opens a raw iterator over the database, using the default read options
-    pub fn raw_iterator<'a: 'b, 'b>(&'a self) -> DBRawIterator<'b> {
-        let opts = ReadOptions::default();
-        DBRawIterator::new(self, opts)
-    }
-
-    /// Opens a raw iterator over the given column family, using the default read options
-    pub fn raw_iterator_cf<'a: 'b, 'b>(&'a self, cf_handle: &ColumnFamily) -> DBRawIterator<'b> {
-        let opts = ReadOptions::default();
-        DBRawIterator::new_cf(self, cf_handle, opts)
-    }
-
-    /// Opens a raw iterator over the database, using the given read options
-    pub fn raw_iterator_opt<'a: 'b, 'b>(&'a self, readopts: ReadOptions) -> DBRawIterator<'b> {
-        DBRawIterator::new(self, readopts)
-    }
-
-    /// Opens a raw iterator over the given column family, using the given read options
-    pub fn raw_iterator_cf_opt<'a: 'b, 'b>(
-        &'a self,
-        cf_handle: &ColumnFamily,
-        readopts: ReadOptions,
-    ) -> DBRawIterator<'b> {
-        DBRawIterator::new_cf(self, cf_handle, readopts)
-    }
-
-    pub fn snapshot(&self) -> Snapshot {
-        Snapshot::new(self)
-    }
-
-    pub fn put_opt<K, V>(&self, key: K, value: V, writeopts: &WriteOptions) -> Result<(), Error>
-    where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
-    {
-        let key = key.as_ref();
-        let value = value.as_ref();
-
-        unsafe {
-            ffi_try!(ffi::rocksdb_put(
-                self.inner,
-                writeopts.inner,
-                key.as_ptr() as *const c_char,
-                key.len() as size_t,
-                value.as_ptr() as *const c_char,
-                value.len() as size_t,
-            ));
-            Ok(())
-        }
-    }
-
-    pub fn put_cf_opt<K, V>(
-        &self,
-        cf: &ColumnFamily,
-        key: K,
-        value: V,
-        writeopts: &WriteOptions,
-    ) -> Result<(), Error>
-    where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
-    {
-        let key = key.as_ref();
-        let value = value.as_ref();
-
-        unsafe {
-            ffi_try!(ffi::rocksdb_put_cf(
-                self.inner,
-                writeopts.inner,
-                cf.inner,
-                key.as_ptr() as *const c_char,
-                key.len() as size_t,
-                value.as_ptr() as *const c_char,
-                value.len() as size_t,
-            ));
-            Ok(())
-        }
-    }
-
-    pub fn merge_opt<K, V>(&self, key: K, value: V, writeopts: &WriteOptions) -> Result<(), Error>
-    where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
-    {
-        let key = key.as_ref();
-        let value = value.as_ref();
-
-        unsafe {
-            ffi_try!(ffi::rocksdb_merge(
-                self.inner,
-                writeopts.inner,
-                key.as_ptr() as *const c_char,
-                key.len() as size_t,
-                value.as_ptr() as *const c_char,
-                value.len() as size_t,
-            ));
-            Ok(())
-        }
-    }
-
-    pub fn merge_cf_opt<K, V>(
-        &self,
-        cf: &ColumnFamily,
-        key: K,
-        value: V,
-        writeopts: &WriteOptions,
-    ) -> Result<(), Error>
-    where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
-    {
-        let key = key.as_ref();
-        let value = value.as_ref();
-
-        unsafe {
-            ffi_try!(ffi::rocksdb_merge_cf(
-                self.inner,
-                writeopts.inner,
-                cf.inner,
-                key.as_ptr() as *const c_char,
-                key.len() as size_t,
-                value.as_ptr() as *const c_char,
-                value.len() as size_t,
-            ));
-            Ok(())
-        }
-    }
-
-    pub fn delete_opt<K: AsRef<[u8]>>(
-        &self,
-        key: K,
-        writeopts: &WriteOptions,
-    ) -> Result<(), Error> {
-        let key = key.as_ref();
-
-        unsafe {
-            ffi_try!(ffi::rocksdb_delete(
-                self.inner,
-                writeopts.inner,
-                key.as_ptr() as *const c_char,
-                key.len() as size_t,
-            ));
-            Ok(())
-        }
-    }
-
-    pub fn delete_cf_opt<K: AsRef<[u8]>>(
-        &self,
-        cf: &ColumnFamily,
-        key: K,
-        writeopts: &WriteOptions,
-    ) -> Result<(), Error> {
-        let key = key.as_ref();
-
-        unsafe {
-            ffi_try!(ffi::rocksdb_delete_cf(
-                self.inner,
-                writeopts.inner,
-                cf.inner,
-                key.as_ptr() as *const c_char,
-                key.len() as size_t,
-            ));
-            Ok(())
-        }
-    }
-
-    /// Removes the database entries in the range `["from", "to")` using given write options.
-    pub fn delete_range_cf_opt<K: AsRef<[u8]>>(
-        &self,
-        cf: &ColumnFamily,
-        from: K,
-        to: K,
-        writeopts: &WriteOptions,
-    ) -> Result<(), Error> {
-        let from = from.as_ref();
-        let to = to.as_ref();
-
-        unsafe {
-            ffi_try!(ffi::rocksdb_delete_range_cf(
-                self.inner,
-                writeopts.inner,
-                cf.inner,
-                from.as_ptr() as *const c_char,
-                from.len() as size_t,
-                to.as_ptr() as *const c_char,
-                to.len() as size_t,
-            ));
-            Ok(())
-        }
-    }
-
-    pub fn put<K, V>(&self, key: K, value: V) -> Result<(), Error>
-    where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
-    {
-        self.put_opt(key.as_ref(), value.as_ref(), &WriteOptions::default())
-    }
-
-    pub fn put_cf<K, V>(&self, cf: &ColumnFamily, key: K, value: V) -> Result<(), Error>
-    where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
-    {
-        self.put_cf_opt(cf, key.as_ref(), value.as_ref(), &WriteOptions::default())
-    }
-
-    pub fn merge<K, V>(&self, key: K, value: V) -> Result<(), Error>
-    where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
-    {
-        self.merge_opt(key.as_ref(), value.as_ref(), &WriteOptions::default())
-    }
-
-    pub fn merge_cf<K, V>(&self, cf: &ColumnFamily, key: K, value: V) -> Result<(), Error>
-    where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
-    {
-        self.merge_cf_opt(cf, key.as_ref(), value.as_ref(), &WriteOptions::default())
-    }
-
-    pub fn delete<K: AsRef<[u8]>>(&self, key: K) -> Result<(), Error> {
-        self.delete_opt(key.as_ref(), &WriteOptions::default())
-    }
-
-    pub fn delete_cf<K: AsRef<[u8]>>(&self, cf: &ColumnFamily, key: K) -> Result<(), Error> {
-        self.delete_cf_opt(cf, key.as_ref(), &WriteOptions::default())
-    }
-
-    /// Removes the database entries in the range `["from", "to")` using default write options.
-    pub fn delete_range_cf<K: AsRef<[u8]>>(
-        &self,
-        cf: &ColumnFamily,
-        from: K,
-        to: K,
-    ) -> Result<(), Error> {
-        self.delete_range_cf_opt(cf, from, to, &WriteOptions::default())
-    }
-
-    /// Runs a manual compaction on the Range of keys given. This is not likely to be needed for typical usage.
-    pub fn compact_range<S: AsRef<[u8]>, E: AsRef<[u8]>>(&self, start: Option<S>, end: Option<E>) {
-        unsafe {
-            let start = start.as_ref().map(AsRef::as_ref);
-            let end = end.as_ref().map(AsRef::as_ref);
-
-            ffi::rocksdb_compact_range(
-                self.inner,
-                opt_bytes_to_ptr(start),
-                start.map_or(0, |s| s.len()) as size_t,
-                opt_bytes_to_ptr(end),
-                end.map_or(0, |e| e.len()) as size_t,
-            );
-        }
-    }
-
-    /// Same as `compact_range` but with custom options.
-    pub fn compact_range_opt<S: AsRef<[u8]>, E: AsRef<[u8]>>(
-        &self,
-        start: Option<S>,
-        end: Option<E>,
-        opts: &CompactOptions,
-    ) {
-        unsafe {
-            let start = start.as_ref().map(AsRef::as_ref);
-            let end = end.as_ref().map(AsRef::as_ref);
-
-            ffi::rocksdb_compact_range_opt(
-                self.inner,
-                opts.inner,
-                opt_bytes_to_ptr(start),
-                start.map_or(0, |s| s.len()) as size_t,
-                opt_bytes_to_ptr(end),
-                end.map_or(0, |e| e.len()) as size_t,
-            );
-        }
-    }
-
-    /// Runs a manual compaction on the Range of keys given on the
-    /// given column family. This is not likely to be needed for typical usage.
-    pub fn compact_range_cf<S: AsRef<[u8]>, E: AsRef<[u8]>>(
-        &self,
-        cf: &ColumnFamily,
-        start: Option<S>,
-        end: Option<E>,
-    ) {
-        unsafe {
-            let start = start.as_ref().map(AsRef::as_ref);
-            let end = end.as_ref().map(AsRef::as_ref);
-
-            ffi::rocksdb_compact_range_cf(
-                self.inner,
-                cf.inner,
-                opt_bytes_to_ptr(start),
-                start.map_or(0, |s| s.len()) as size_t,
-                opt_bytes_to_ptr(end),
-                end.map_or(0, |e| e.len()) as size_t,
-            );
-        }
-    }
-
-    /// Same as `compact_range_cf` but with custom options.
-    pub fn compact_range_cf_opt<S: AsRef<[u8]>, E: AsRef<[u8]>>(
-        &self,
-        cf: &ColumnFamily,
-        start: Option<S>,
-        end: Option<E>,
-        opts: &CompactOptions,
-    ) {
-        unsafe {
-            let start = start.as_ref().map(AsRef::as_ref);
-            let end = end.as_ref().map(AsRef::as_ref);
-
-            ffi::rocksdb_compact_range_cf_opt(
-                self.inner,
-                cf.inner,
-                opts.inner,
-                opt_bytes_to_ptr(start),
-                start.map_or(0, |s| s.len()) as size_t,
-                opt_bytes_to_ptr(end),
-                end.map_or(0, |e| e.len()) as size_t,
-            );
-        }
-    }
-
-    pub fn set_options(&self, opts: &[(&str, &str)]) -> Result<(), Error> {
-        let copts = convert_options(opts)?;
-        let cnames: Vec<*const c_char> = copts.iter().map(|opt| opt.0.as_ptr()).collect();
-        let cvalues: Vec<*const c_char> = copts.iter().map(|opt| opt.1.as_ptr()).collect();
-        let count = opts.len() as i32;
-        unsafe {
-            ffi_try!(ffi::rocksdb_set_options(
-                self.inner,
-                count,
-                cnames.as_ptr(),
-                cvalues.as_ptr(),
-            ));
-        }
-        Ok(())
-    }
-
-    pub fn set_options_cf(
-        &self,
-        cf_handle: &ColumnFamily,
-        opts: &[(&str, &str)],
-    ) -> Result<(), Error> {
-        let copts = convert_options(opts)?;
-        let cnames: Vec<*const c_char> = copts.iter().map(|opt| opt.0.as_ptr()).collect();
-        let cvalues: Vec<*const c_char> = copts.iter().map(|opt| opt.1.as_ptr()).collect();
-        let count = opts.len() as i32;
-        unsafe {
-            ffi_try!(ffi::rocksdb_set_options_cf(
-                self.inner,
-                cf_handle.inner,
-                count,
-                cnames.as_ptr(),
-                cvalues.as_ptr(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Retrieves a RocksDB property by name.
-    ///
-    /// Full list of properties could be find
-    /// [here](https://github.com/facebook/rocksdb/blob/08809f5e6cd9cc4bc3958dd4d59457ae78c76660/include/rocksdb/db.h#L428-L634).
-    pub fn property_value(&self, name: &str) -> Result<Option<String>, Error> {
-        let prop_name = match CString::new(name) {
-            Ok(c) => c,
-            Err(e) => {
-                return Err(Error::new(format!(
-                    "Failed to convert property name to CString: {}",
-                    e
-                )));
-            }
-        };
-
-        unsafe {
-            let value = ffi::rocksdb_property_value(self.inner, prop_name.as_ptr());
-            if value.is_null() {
-                return Ok(None);
-            }
-
-            let str_value = match CStr::from_ptr(value).to_str() {
-                Ok(s) => s.to_owned(),
-                Err(e) => {
-                    return Err(Error::new(format!(
-                        "Failed to convert property value to string: {}",
-                        e
-                    )));
-                }
-            };
-
-            libc::free(value as *mut c_void);
-            Ok(Some(str_value))
-        }
-    }
-
-    /// Retrieves a RocksDB property by name, for a specific column family.
-    ///
-    /// Full list of properties could be find
-    /// [here](https://github.com/facebook/rocksdb/blob/08809f5e6cd9cc4bc3958dd4d59457ae78c76660/include/rocksdb/db.h#L428-L634).
-    pub fn property_value_cf(
-        &self,
-        cf: &ColumnFamily,
-        name: &str,
-    ) -> Result<Option<String>, Error> {
-        let prop_name = match CString::new(name) {
-            Ok(c) => c,
-            Err(e) => {
-                return Err(Error::new(format!(
-                    "Failed to convert property name to CString: {}",
-                    e
-                )));
-            }
-        };
-
-        unsafe {
-            let value = ffi::rocksdb_property_value_cf(self.inner, cf.inner, prop_name.as_ptr());
-            if value.is_null() {
-                return Ok(None);
-            }
-
-            let str_value = match CStr::from_ptr(value).to_str() {
-                Ok(s) => s.to_owned(),
-                Err(e) => {
-                    return Err(Error::new(format!(
-                        "Failed to convert property value to string: {}",
-                        e
-                    )));
-                }
-            };
-
-            libc::free(value as *mut c_void);
-            Ok(Some(str_value))
-        }
-    }
-
-    /// Retrieves a RocksDB property and casts it to an integer.
-    ///
-    /// Full list of properties that return int values could be find
-    /// [here](https://github.com/facebook/rocksdb/blob/08809f5e6cd9cc4bc3958dd4d59457ae78c76660/include/rocksdb/db.h#L654-L689).
-    pub fn property_int_value(&self, name: &str) -> Result<Option<u64>, Error> {
-        match self.property_value(name) {
-            Ok(Some(value)) => match value.parse::<u64>() {
-                Ok(int_value) => Ok(Some(int_value)),
-                Err(e) => Err(Error::new(format!(
-                    "Failed to convert property value to int: {}",
-                    e
-                ))),
-            },
-            Ok(None) => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Retrieves a RocksDB property for a specific column family and casts it to an integer.
-    ///
-    /// Full list of properties that return int values could be find
-    /// [here](https://github.com/facebook/rocksdb/blob/08809f5e6cd9cc4bc3958dd4d59457ae78c76660/include/rocksdb/db.h#L654-L689).
-    pub fn property_int_value_cf(
-        &self,
-        cf: &ColumnFamily,
-        name: &str,
-    ) -> Result<Option<u64>, Error> {
-        match self.property_value_cf(cf, name) {
-            Ok(Some(value)) => match value.parse::<u64>() {
-                Ok(int_value) => Ok(Some(int_value)),
-                Err(e) => Err(Error::new(format!(
-                    "Failed to convert property value to int: {}",
-                    e
-                ))),
-            },
-            Ok(None) => Ok(None),
-            Err(e) => Err(e),
-        }
     }
 
     /// The sequence number of the most recent transaction.
@@ -1276,101 +283,6 @@ impl DB {
             let opts: *const ffi::rocksdb_wal_readoptions_t = ptr::null();
             let iter = ffi_try!(ffi::rocksdb_get_updates_since(self.inner, seq_number, opts));
             Ok(DBWALIterator { inner: iter })
-        }
-    }
-
-    /// Tries to catch up with the primary by reading as much as possible from the
-    /// log files.
-    pub fn try_catch_up_with_primary(&self) -> Result<(), Error> {
-        unsafe {
-            ffi_try!(ffi::rocksdb_try_catch_up_with_primary(self.inner));
-        }
-        Ok(())
-    }
-
-    /// Loads a list of external SST files created with SstFileWriter into the DB with default opts
-    pub fn ingest_external_file<P: AsRef<Path>>(&self, paths: Vec<P>) -> Result<(), Error> {
-        let opts = IngestExternalFileOptions::default();
-        self.ingest_external_file_opts(&opts, paths)
-    }
-
-    /// Loads a list of external SST files created with SstFileWriter into the DB
-    pub fn ingest_external_file_opts<P: AsRef<Path>>(
-        &self,
-        opts: &IngestExternalFileOptions,
-        paths: Vec<P>,
-    ) -> Result<(), Error> {
-        let paths_v: Vec<CString> = paths
-            .iter()
-            .map(|path| to_cpath(&path))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let cpaths: Vec<_> = paths_v.iter().map(|path| path.as_ptr()).collect();
-
-        self.ingest_external_file_raw(&opts, &paths_v, &cpaths)
-    }
-
-    /// Loads a list of external SST files created with SstFileWriter into the DB for given Column Family
-    /// with default opts
-    pub fn ingest_external_file_cf<P: AsRef<Path>>(
-        &self,
-        cf: &ColumnFamily,
-        paths: Vec<P>,
-    ) -> Result<(), Error> {
-        let opts = IngestExternalFileOptions::default();
-        self.ingest_external_file_cf_opts(&cf, &opts, paths)
-    }
-
-    /// Loads a list of external SST files created with SstFileWriter into the DB for given Column Family
-    pub fn ingest_external_file_cf_opts<P: AsRef<Path>>(
-        &self,
-        cf: &ColumnFamily,
-        opts: &IngestExternalFileOptions,
-        paths: Vec<P>,
-    ) -> Result<(), Error> {
-        let paths_v: Vec<CString> = paths
-            .iter()
-            .map(|path| to_cpath(&path))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let cpaths: Vec<_> = paths_v.iter().map(|path| path.as_ptr()).collect();
-
-        self.ingest_external_file_raw_cf(&cf, &opts, &paths_v, &cpaths)
-    }
-
-    fn ingest_external_file_raw(
-        &self,
-        opts: &IngestExternalFileOptions,
-        paths_v: &[CString],
-        cpaths: &[*const c_char],
-    ) -> Result<(), Error> {
-        unsafe {
-            ffi_try!(ffi::rocksdb_ingest_external_file(
-                self.inner,
-                cpaths.as_ptr(),
-                paths_v.len(),
-                opts.inner as *const _
-            ));
-            Ok(())
-        }
-    }
-
-    fn ingest_external_file_raw_cf(
-        &self,
-        cf: &ColumnFamily,
-        opts: &IngestExternalFileOptions,
-        paths_v: &[CString],
-        cpaths: &[*const c_char],
-    ) -> Result<(), Error> {
-        unsafe {
-            ffi_try!(ffi::rocksdb_ingest_external_file_cf(
-                self.inner,
-                cf.inner,
-                cpaths.as_ptr(),
-                paths_v.len(),
-                opts.inner as *const _
-            ));
-            Ok(())
         }
     }
 
@@ -1420,60 +332,40 @@ impl DB {
         }
     }
 
-    /// Delete sst files whose keys are entirely in the given range.
-    ///
-    /// Could leave some keys in the range which are in files which are not
-    /// entirely in the range.
-    ///
-    /// Note: L0 files are left regardless of whether they're in the range.
-    ///  
-    /// Snapshots before the delete might not see the data in the given range.
-    pub fn delete_file_in_range<K: AsRef<[u8]>>(&self, from: K, to: K) -> Result<(), Error> {
-        let from = from.as_ref();
-        let to = to.as_ref();
-        unsafe {
-            ffi_try!(ffi::rocksdb_delete_file_in_range(
-                self.inner,
-                from.as_ptr() as *const c_char,
-                from.len() as size_t,
-                to.as_ptr() as *const c_char,
-                to.len() as size_t,
-            ));
-            Ok(())
-        }
-    }
-
-    /// Same as `delete_file_in_range` but only for specific column family
-    pub fn delete_file_in_range_cf<K: AsRef<[u8]>>(
-        &self,
-        cf: &ColumnFamily,
-        from: K,
-        to: K,
-    ) -> Result<(), Error> {
-        let from = from.as_ref();
-        let to = to.as_ref();
-        unsafe {
-            ffi_try!(ffi::rocksdb_delete_file_in_range_cf(
-                self.inner,
-                cf.inner,
-                from.as_ptr() as *const c_char,
-                from.len() as size_t,
-                to.as_ptr() as *const c_char,
-                to.len() as size_t,
-            ));
-            Ok(())
-        }
-    }
-
     /// Request stopping background work, if wait is true wait until it's done.
     pub fn cancel_all_background_work(&self, wait: bool) {
         unsafe {
             ffi::rocksdb_cancel_all_background_work(self.inner, wait as u8);
         }
     }
+
+    unsafe fn create_snapshot_rocksdb<'a, D>(&self, db: &'a D) -> Snapshot<'a, D>
+    where
+        D: SnapshotInternal<DB = D>,
+    {
+        let inner = ffi::rocksdb_create_snapshot(self.handle());
+        Snapshot { db, inner }
+    }
+
+    unsafe fn release_snapshot_rocksdb<'a, D>(&self, snapshot: &mut Snapshot<'a, D>)
+    where
+        D: SnapshotInternal<DB = D>,
+    {
+        ffi::rocksdb_release_snapshot(self.handle(), snapshot.inner);
+    }
 }
 
-impl Drop for DB {
+impl GetColumnFamilies for DBInner {
+    fn get_cfs(&self) -> &BTreeMap<String, ColumnFamily> {
+        &self.cfs
+    }
+
+    fn get_mut_cfs(&mut self) -> &mut BTreeMap<String, ColumnFamily> {
+        &mut self.cfs
+    }
+}
+
+impl Drop for DBInner {
     fn drop(&mut self) {
         unsafe {
             for cf in self.cfs.values() {
@@ -1484,7 +376,7 @@ impl Drop for DB {
     }
 }
 
-impl fmt::Debug for DB {
+impl fmt::Debug for DBInner {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "RocksDB {{ path: {:?} }}", self.path())
     }
@@ -1509,32 +401,336 @@ pub struct LiveFile {
     pub num_deletions: u64,
 }
 
-fn convert_options(opts: &[(&str, &str)]) -> Result<Vec<(CString, CString)>, Error> {
-    opts.iter()
-        .map(|(name, value)| {
-            let cname = match CString::new(name.as_bytes()) {
-                Ok(cname) => cname,
-                Err(e) => return Err(Error::new(format!("Invalid option name `{}`", e))),
-            };
-            let cvalue = match CString::new(value.as_bytes()) {
-                Ok(cvalue) => cvalue,
-                Err(e) => return Err(Error::new(format!("Invalid option value: `{}`", e))),
-            };
-            Ok((cname, cvalue))
-        })
-        .collect()
+pub struct DBUtils;
+
+impl DBUtils {
+    pub fn list_cf<P: AsRef<Path>>(opts: &Options, path: P) -> Result<Vec<String>, Error> {
+        let cpath = to_cpath(path)?;
+        let mut length = 0;
+
+        unsafe {
+            let ptr = ffi_try!(ffi::rocksdb_list_column_families(
+                opts.inner,
+                cpath.as_ptr() as *const _,
+                &mut length,
+            ));
+
+            let vec = slice::from_raw_parts(ptr, length)
+                .iter()
+                .map(|ptr| CStr::from_ptr(*ptr).to_string_lossy().into_owned())
+                .collect();
+            ffi::rocksdb_list_column_families_destroy(ptr, length);
+            Ok(vec)
+        }
+    }
+
+    pub fn destroy<P: AsRef<Path>>(opts: &Options, path: P) -> Result<(), Error> {
+        let cpath = to_cpath(path)?;
+        unsafe {
+            ffi_try!(ffi::rocksdb_destroy_db(opts.inner, cpath.as_ptr()));
+        }
+        Ok(())
+    }
+
+    pub fn repair<P: AsRef<Path>>(opts: &Options, path: P) -> Result<(), Error> {
+        let cpath = to_cpath(path)?;
+        unsafe {
+            ffi_try!(ffi::rocksdb_repair_db(opts.inner, cpath.as_ptr()));
+        }
+        Ok(())
+    }
 }
 
-fn convert_values(values: Vec<*mut c_char>, values_sizes: Vec<usize>) -> Vec<Vec<u8>> {
-    values
-        .into_iter()
-        .zip(values_sizes.into_iter())
-        .map(|(v, s)| {
-            let value = unsafe { slice::from_raw_parts(v as *const u8, s) }.into();
-            unsafe {
-                ffi::rocksdb_free(v as *mut c_void);
+macro_rules! make_new_db_with_traits {
+    ($struct_name:ident, [$($d:ty),+])  => (
+        #[derive(Delegate)]
+        $(#[delegate($d)])+
+        pub struct $struct_name(DBInner);
+
+        #[allow(clippy::inline_always)]
+        impl $struct_name {
+            #[inline(always)]
+            pub fn path(&self) -> &Path {
+                self.0.path()
             }
-            value
-        })
-        .collect()
+
+            #[inline(always)]
+            pub fn latest_sequence_number(&self) -> u64 {
+                self.0.latest_sequence_number()
+            }
+
+            #[inline(always)]
+            pub fn get_updates_since(&self, seq_number: u64) -> Result<DBWALIterator, Error> {
+               self.0.get_updates_since(seq_number)
+            }
+
+            #[inline(always)]
+            pub fn live_files(&self) -> Result<Vec<LiveFile>, Error> {
+                self.0.live_files()
+            }
+
+            #[inline(always)]
+            pub fn cancel_all_background_work(&self, wait: bool) {
+                self.0.cancel_all_background_work(wait)
+            }
+        }
+
+        impl SnapshotInternal for $struct_name {
+            type DB = Self;
+
+            unsafe fn create_snapshot(&self) -> Snapshot<Self> {
+                self.0.create_snapshot_rocksdb(self)
+            }
+
+            unsafe fn release_snapshot(&self, snapshot: &mut Snapshot<Self>) {
+                self.0.release_snapshot_rocksdb(snapshot)
+            }
+        }
+
+        impl MultiGetOpt<&ReadOptions> for $struct_name {
+            fn multi_get_opt<K, I>(&self, keys: I, readopts: &ReadOptions) -> Result<Vec<Vec<u8>>, Error>
+            where
+                K: AsRef<[u8]>,
+                I: IntoIterator<Item = K>,
+            {
+                self.0.multi_get_opt(keys, readopts)
+            }
+        }
+
+        impl MultiGetCFOpt<&ReadOptions> for $struct_name {
+            fn multi_get_cf_opt<'c, K, I>(
+                &self,
+                keys: I,
+                readopts: &ReadOptions,
+            ) -> Result<Vec<Vec<u8>>, Error>
+            where
+                K: AsRef<[u8]>,
+                I: IntoIterator<Item = (&'c ColumnFamily, K)>,
+            {
+                self.0.multi_get_cf_opt(keys, readopts)
+            }
+        }
+
+    )
+}
+
+make_new_db_with_traits!(
+    DB,
+    [
+        BackupInternal,
+        CheckpointInternal,
+        CreateColumnFamily,
+        DropColumnFamily,
+        GetColumnFamily,
+        CompactRangeCFOpt,
+        CompactRangeOpt,
+        DeleteCFOpt,
+        DeleteOpt,
+        DeleteRangeCFOpt,
+        DeleteFileInRange,
+        DeleteFileInRangeCF,
+        FlushCFOpt,
+        FlushOpt,
+        GetPinnedCFOpt,
+        GetPinnedOpt,
+        IngestExternalFileCFOpt,
+        IngestExternalFileOpt,
+        Iterate,
+        IterateCF,
+        MergeCFOpt,
+        MergeOpt,
+        GetProperty,
+        GetPropertyCF,
+        PerfInternal,
+        PutCFOpt,
+        PutOpt,
+        SetOptions,
+        SetOptionsCF,
+        WriteBatchWriteOpt
+    ]
+);
+
+impl DB {
+    /// Opens a database with default options.
+    pub fn open_default<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        Self::open(&opts, path)
+    }
+
+    /// Opens the database with the specified options.
+    pub fn open<P: AsRef<Path>>(opts: &Options, path: P) -> Result<Self, Error> {
+        Self::open_cf(opts, path, None::<&str>)
+    }
+
+    /// Opens a database with the given database options and column family names.
+    ///
+    /// Column families opened using this function will be created with default `Options`.
+    pub fn open_cf<P, I, N>(opts: &Options, path: P, cfs: I) -> Result<Self, Error>
+    where
+        P: AsRef<Path>,
+        I: IntoIterator<Item = N>,
+        N: AsRef<str>,
+    {
+        let cfs = cfs
+            .into_iter()
+            .map(|name| ColumnFamilyDescriptor::new(name.as_ref(), Options::default()));
+
+        DBInner::open_cf_descriptors_internal(opts, path, cfs, &AccessType::ReadWrite).map(Self)
+    }
+
+    /// Opens a database with the given database options and column family descriptors.
+    pub fn open_cf_descriptors<P, I>(opts: &Options, path: P, cfs: I) -> Result<Self, Error>
+    where
+        P: AsRef<Path>,
+        I: IntoIterator<Item = ColumnFamilyDescriptor>,
+    {
+        DBInner::open_cf_descriptors_internal(opts, path, cfs, &AccessType::ReadWrite).map(Self)
+    }
+}
+
+make_new_db_with_traits!(
+    ReadOnlyDB,
+    [
+        BackupInternal,
+        CheckpointInternal,
+        GetColumnFamily,
+        GetPinnedCFOpt,
+        GetPinnedOpt,
+        Iterate,
+        IterateCF,
+        GetProperty,
+        GetPropertyCF,
+        PerfInternal
+    ]
+);
+
+impl ReadOnlyDB {
+    /// Opens the database for read only with the specified options.
+    pub fn open<P: AsRef<Path>>(
+        opts: &Options,
+        path: P,
+        error_if_log_file_exist: bool,
+    ) -> Result<Self, Error> {
+        Self::open_cf(opts, path, None::<&str>, error_if_log_file_exist)
+    }
+
+    /// Opens a database for read only with the given database options and column family names.
+    pub fn open_cf<P, I, N>(
+        opts: &Options,
+        path: P,
+        cfs: I,
+        error_if_log_file_exist: bool,
+    ) -> Result<Self, Error>
+    where
+        P: AsRef<Path>,
+        I: IntoIterator<Item = N>,
+        N: AsRef<str>,
+    {
+        let cfs = cfs
+            .into_iter()
+            .map(|name| ColumnFamilyDescriptor::new(name.as_ref(), Options::default()));
+
+        DBInner::open_cf_descriptors_internal(
+            opts,
+            path,
+            cfs,
+            &AccessType::ReadOnly {
+                error_if_log_file_exist,
+            },
+        )
+        .map(Self)
+    }
+}
+
+make_new_db_with_traits!(
+    SecondaryDB,
+    [
+        BackupInternal,
+        CheckpointInternal,
+        GetColumnFamily,
+        GetPinnedCFOpt,
+        GetPinnedOpt,
+        Iterate,
+        IterateCF,
+        GetProperty,
+        GetPropertyCF,
+        PerfInternal
+    ]
+);
+
+impl SecondaryDB {
+    /// Opens the database as a secondary.
+    pub fn open<P: AsRef<Path>>(
+        opts: &Options,
+        primary_path: P,
+        secondary_path: P,
+    ) -> Result<Self, Error> {
+        Self::open_cf(opts, primary_path, secondary_path, None::<&str>)
+    }
+
+    /// Opens the database as a secondary with the given database options and column family names.
+    pub fn open_cf<P, I, N>(
+        opts: &Options,
+        primary_path: P,
+        secondary_path: P,
+        cfs: I,
+    ) -> Result<Self, Error>
+    where
+        P: AsRef<Path>,
+        I: IntoIterator<Item = N>,
+        N: AsRef<str>,
+    {
+        let cfs = cfs
+            .into_iter()
+            .map(|name| ColumnFamilyDescriptor::new(name.as_ref(), Options::default()));
+
+        DBInner::open_cf_descriptors_internal(
+            opts,
+            primary_path,
+            cfs,
+            &AccessType::Secondary {
+                secondary_path: secondary_path.as_ref(),
+            },
+        )
+        .map(Self)
+    }
+
+    /// Tries to catch up with the primary by reading as much as possible from the
+    /// log files.
+    pub fn try_catch_up_with_primary(&self) -> Result<(), Error> {
+        unsafe {
+            ffi_try!(ffi::rocksdb_try_catch_up_with_primary(self.0.inner));
+        }
+        Ok(())
+    }
+}
+
+make_new_db_with_traits!(
+    DBWithTTL,
+    [
+        BackupInternal,
+        CheckpointInternal,
+        CompactRangeOpt,
+        DeleteOpt,
+        DeleteFileInRange,
+        FlushOpt,
+        GetPinnedOpt,
+        IngestExternalFileOpt,
+        Iterate,
+        MergeOpt,
+        GetProperty,
+        PerfInternal,
+        PutOpt,
+        SetOptions,
+        WriteBatchWriteOpt
+    ]
+);
+
+impl DBWithTTL {
+    /// Opens the database with a Time to Live compaction filter.
+    pub fn open<P: AsRef<Path>>(opts: &Options, path: P, ttl: Duration) -> Result<Self, Error> {
+        DBInner::open_cf_descriptors_internal(opts, path, None, &AccessType::WithTTL { ttl })
+            .map(Self)
+    }
 }

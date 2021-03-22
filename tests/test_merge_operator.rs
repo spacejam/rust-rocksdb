@@ -17,7 +17,7 @@ mod util;
 use pretty_assertions::assert_eq;
 
 use rocksdb::merge_operator::MergeFn;
-use rocksdb::{DBCompactionStyle, MergeOperands, Options, DB};
+use rocksdb::{prelude::*, DBCompactionStyle, DBUtils, MergeOperands};
 use util::DBPath;
 
 fn test_provided_merge(
@@ -335,7 +335,7 @@ fn test_merge_state() {
         assert!(db.delete(b"k1").is_ok());
         assert!(db.get(b"k1").unwrap().is_none());
     }
-    assert!(DB::destroy(&opts, path).is_ok());
+    assert!(DBUtils::destroy(&opts, path).is_ok());
 
     opts.set_merge_operator_associative("max-limit-128", make_merge_max_with_limit(128));
     {
@@ -358,5 +358,5 @@ fn test_merge_state() {
         assert!(db.delete(b"k1").is_ok());
         assert!(db.get(b"k1").unwrap().is_none());
     }
-    assert!(DB::destroy(&opts, path).is_ok());
+    assert!(DBUtils::destroy(&opts, path).is_ok());
 }

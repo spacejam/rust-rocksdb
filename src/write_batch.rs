@@ -21,7 +21,7 @@ use std::slice;
 /// Making an atomic commit of several writes:
 ///
 /// ```
-/// use rocksdb::{DB, Options, WriteBatch};
+/// use rocksdb::{prelude::*, WriteBatch};
 ///
 /// let path = "_path_for_rocksdb_storage1";
 /// {
@@ -32,7 +32,7 @@ use std::slice;
 ///     batch.put(b"key3", b"value3");
 ///     db.write(batch); // Atomically commits the batch
 /// }
-/// let _ = DB::destroy(&Options::default(), path);
+/// let _ = DBUtils::destroy(&Options::default(), path);
 /// ```
 pub struct WriteBatch {
     pub(crate) inner: *mut ffi::rocksdb_writebatch_t,

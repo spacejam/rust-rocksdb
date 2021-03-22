@@ -18,7 +18,7 @@
 //! # Examples
 //!
 //! ```
-//! use rocksdb::{DB, Options};
+//! use rocksdb::prelude::*;
 //! // NB: db is automatically closed at end of lifetime
 //! let path = "_path_for_rocksdb_storage";
 //! {
@@ -31,13 +31,13 @@
 //!    }
 //!    db.delete(b"my key").unwrap();
 //! }
-//! let _ = DB::destroy(&Options::default(), path);
+//! let _ = DBUtils::destroy(&Options::default(), path);
 //! ```
 //!
 //! Opening a database and a single column family with custom options:
 //!
 //! ```
-//! use rocksdb::{DB, ColumnFamilyDescriptor, Options};
+//! use rocksdb::{prelude::*, ColumnFamilyDescriptor};
 //!
 //! let path = "_path_for_rocksdb_storage_with_cfs";
 //! let mut cf_opts = Options::default();
@@ -50,7 +50,7 @@
 //! {
 //!     let db = DB::open_cf_descriptors(&db_opts, path, vec![cf]).unwrap();
 //! }
-//! let _ = DB::destroy(&db_opts, path);
+//! let _ = DBUtils::destroy(&db_opts, path);
 //! ```
 //!
 
@@ -74,6 +74,8 @@
 
 #[macro_use]
 mod ffi_util;
+#[macro_use]
+pub mod ops;
 
 pub mod backup;
 pub mod checkpoint;
@@ -85,8 +87,10 @@ mod db;
 mod db_iterator;
 mod db_options;
 mod db_pinnable_slice;
+mod handle;
 pub mod merge_operator;
 pub mod perf;
+pub mod prelude;
 mod slice_transform;
 mod snapshot;
 mod sst_file_writer;
@@ -95,7 +99,7 @@ mod write_batch;
 pub use crate::{
     column_family::{ColumnFamily, ColumnFamilyDescriptor, DEFAULT_COLUMN_FAMILY_NAME},
     compaction_filter::Decision as CompactionDecision,
-    db::{LiveFile, DB},
+    db::{DBUtils, DBWithTTL, LiveFile, ReadOnlyDB, SecondaryDB, DB},
     db_iterator::{DBIterator, DBRawIterator, DBWALIterator, Direction, IteratorMode},
     db_options::{
         BlockBasedIndexType, BlockBasedOptions, BottommostLevelCompaction, Cache, CompactOptions,
@@ -162,9 +166,8 @@ impl fmt::Display for Error {
 #[cfg(test)]
 mod test {
     use super::{
-        BlockBasedOptions, ColumnFamily, ColumnFamilyDescriptor, DBIterator, DBRawIterator,
-        IngestExternalFileOptions, Options, PlainTableFactoryOptions, ReadOptions, Snapshot,
-        SstFileWriter, WriteBatch, WriteOptions, DB,
+        prelude::*, BlockBasedOptions, ColumnFamilyDescriptor, DBIterator, DBRawIterator,
+        IngestExternalFileOptions, PlainTableFactoryOptions, Snapshot, SstFileWriter, WriteBatch,
     };
 
     #[test]
@@ -179,7 +182,7 @@ mod test {
         is_send::<DB>();
         is_send::<DBIterator<'_>>();
         is_send::<DBRawIterator<'_>>();
-        is_send::<Snapshot>();
+        is_send::<Snapshot<DB>>();
         is_send::<Options>();
         is_send::<ReadOptions>();
         is_send::<WriteOptions>();
@@ -201,7 +204,7 @@ mod test {
         }
 
         is_sync::<DB>();
-        is_sync::<Snapshot>();
+        is_sync::<Snapshot<DB>>();
         is_sync::<Options>();
         is_sync::<ReadOptions>();
         is_sync::<WriteOptions>();

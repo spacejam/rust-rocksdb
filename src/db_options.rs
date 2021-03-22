@@ -26,6 +26,7 @@ use crate::{
     merge_operator::{
         self, full_merge_callback, partial_merge_callback, MergeFn, MergeOperatorCallback,
     },
+    ops::SnapshotInternal,
     slice_transform::SliceTransform,
     Error, Snapshot,
 };
@@ -197,8 +198,7 @@ impl Env {
 /// # Examples
 ///
 /// ```
-/// use rocksdb::{Options, DB};
-/// use rocksdb::DBCompactionStyle;
+/// use rocksdb::{prelude::*, DBCompactionStyle};
 ///
 /// fn badly_tuned_for_somebody_elses_disk() -> DB {
 ///    let path = "path/for/rocksdb/storageX";
@@ -234,7 +234,7 @@ pub struct Options {
 /// Making an unsafe write of a batch:
 ///
 /// ```
-/// use rocksdb::{DB, Options, WriteBatch, WriteOptions};
+/// use rocksdb::{prelude::*, WriteBatch};
 ///
 /// let path = "_path_for_rocksdb_storageY1";
 /// {
@@ -250,7 +250,7 @@ pub struct Options {
 ///
 ///     db.write_opt(batch, &write_options);
 /// }
-/// let _ = DB::destroy(&Options::default(), path);
+/// let _ = DBUtils::destroy(&Options::default(), path);
 /// ```
 pub struct WriteOptions {
     pub(crate) inner: *mut ffi::rocksdb_writeoptions_t,
@@ -263,7 +263,7 @@ pub struct WriteOptions {
 /// Manually flushing the memtable:
 ///
 /// ```
-/// use rocksdb::{DB, Options, FlushOptions};
+/// use rocksdb::{prelude::*, FlushOptions};
 ///
 /// let path = "_path_for_rocksdb_storageY2";
 /// {
@@ -274,7 +274,7 @@ pub struct WriteOptions {
 ///
 ///     db.flush_opt(&flush_options);
 /// }
-/// let _ = DB::destroy(&Options::default(), path);
+/// let _ = DBUtils::destroy(&Options::default(), path);
 /// ```
 pub struct FlushOptions {
     pub(crate) inner: *mut ffi::rocksdb_flushoptions_t,
@@ -298,7 +298,7 @@ pub struct ReadOptions {
 /// Move files instead of copying them:
 ///
 /// ```
-/// use rocksdb::{DB, IngestExternalFileOptions, SstFileWriter, Options};
+/// use rocksdb::{prelude::*, IngestExternalFileOptions, SstFileWriter, Options};
 ///
 /// let writer_opts = Options::default();
 /// let mut writer = SstFileWriter::create(&writer_opts);
@@ -313,7 +313,7 @@ pub struct ReadOptions {
 ///   ingest_opts.set_move_files(true);
 ///   db.ingest_external_file_opts(&ingest_opts, vec!["_path_for_sst_file"]).unwrap();
 /// }
-/// let _ = DB::destroy(&Options::default(), path);
+/// let _ = DBUtils::destroy(&Options::default(), path);
 /// ```
 pub struct IngestExternalFileOptions {
     pub(crate) inner: *mut ffi::rocksdb_ingestexternalfileoptions_t,
@@ -2849,7 +2849,10 @@ impl ReadOptions {
     /// Sets the snapshot which should be used for the read.
     /// The snapshot must belong to the DB that is being read and must
     /// not have been released.
-    pub(crate) fn set_snapshot(&mut self, snapshot: &Snapshot) {
+    pub(crate) fn set_snapshot<T>(&mut self, snapshot: &Snapshot<T>)
+    where
+        T: SnapshotInternal<DB = T>,
+    {
         unsafe {
             ffi::rocksdb_readoptions_set_snapshot(self.inner, snapshot.inner);
         }

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{ffi, ColumnFamily, Error, ReadOptions, WriteBatch, DB};
+use crate::{ffi, Error, ReadOptions, WriteBatch};
 use libc::{c_char, c_uchar, size_t};
 use std::marker::PhantomData;
 use std::slice;
@@ -26,7 +26,7 @@ use std::slice;
 /// widely recognised Rust idioms.
 ///
 /// ```
-/// use rocksdb::{DB, Options};
+/// use rocksdb::prelude::*;
 ///
 /// let path = "_path_for_rocksdb_storage4";
 /// {
@@ -63,7 +63,7 @@ use std::slice;
 ///         iter.prev();
 ///     }
 /// }
-/// let _ = DB::destroy(&Options::default(), path);
+/// let _ = DBUtils::destroy(&Options::default(), path);
 /// ```
 pub struct DBRawIterator<'a> {
     inner: *mut ffi::rocksdb_iterator_t,
@@ -73,31 +73,18 @@ pub struct DBRawIterator<'a> {
     /// iterator is being used.
     _readopts: ReadOptions,
 
-    db: PhantomData<&'a DB>,
+    db: PhantomData<&'a ()>,
 }
 
 impl<'a> DBRawIterator<'a> {
-    pub(crate) fn new(db: &DB, readopts: ReadOptions) -> DBRawIterator<'a> {
-        unsafe {
-            DBRawIterator {
-                inner: ffi::rocksdb_create_iterator(db.inner, readopts.inner),
-                _readopts: readopts,
-                db: PhantomData,
-            }
-        }
-    }
-
-    pub(crate) fn new_cf(
-        db: &DB,
-        cf_handle: &ColumnFamily,
+    pub(crate) fn new(
+        inner: *mut ffi::rocksdb_iterator_t,
         readopts: ReadOptions,
     ) -> DBRawIterator<'a> {
-        unsafe {
-            DBRawIterator {
-                inner: ffi::rocksdb_create_iterator_cf(db.inner, readopts.inner, cf_handle.inner),
-                _readopts: readopts,
-                db: PhantomData,
-            }
+        DBRawIterator {
+            inner,
+            _readopts: readopts,
+            db: PhantomData,
         }
     }
 
@@ -128,7 +115,7 @@ impl<'a> DBRawIterator<'a> {
     /// # Examples
     ///
     /// ```rust
-    /// use rocksdb::{DB, Options};
+    /// use rocksdb::prelude::*;
     ///
     /// let path = "_path_for_rocksdb_storage5";
     /// {
@@ -152,7 +139,7 @@ impl<'a> DBRawIterator<'a> {
     ///         // There are no keys in the database
     ///     }
     /// }
-    /// let _ = DB::destroy(&Options::default(), path);
+    /// let _ = DBUtils::destroy(&Options::default(), path);
     /// ```
     pub fn seek_to_first(&mut self) {
         unsafe {
@@ -165,7 +152,7 @@ impl<'a> DBRawIterator<'a> {
     /// # Examples
     ///
     /// ```rust
-    /// use rocksdb::{DB, Options};
+    /// use rocksdb::prelude::*;
     ///
     /// let path = "_path_for_rocksdb_storage6";
     /// {
@@ -189,7 +176,7 @@ impl<'a> DBRawIterator<'a> {
     ///         // There are no keys in the database
     ///     }
     /// }
-    /// let _ = DB::destroy(&Options::default(), path);
+    /// let _ = DBUtils::destroy(&Options::default(), path);
     /// ```
     pub fn seek_to_last(&mut self) {
         unsafe {
@@ -205,7 +192,7 @@ impl<'a> DBRawIterator<'a> {
     /// # Examples
     ///
     /// ```rust
-    /// use rocksdb::{DB, Options};
+    /// use rocksdb::prelude::*;
     ///
     /// let path = "_path_for_rocksdb_storage7";
     /// {
@@ -221,7 +208,7 @@ impl<'a> DBRawIterator<'a> {
     ///         // There are no keys in the database
     ///     }
     /// }
-    /// let _ = DB::destroy(&Options::default(), path);
+    /// let _ = DBUtils::destroy(&Options::default(), path);
     /// ```
     pub fn seek<K: AsRef<[u8]>>(&mut self, key: K) {
         let key = key.as_ref();
@@ -244,7 +231,7 @@ impl<'a> DBRawIterator<'a> {
     /// # Examples
     ///
     /// ```rust
-    /// use rocksdb::{DB, Options};
+    /// use rocksdb::prelude::*;
     ///
     /// let path = "_path_for_rocksdb_storage8";
     /// {
@@ -260,7 +247,7 @@ impl<'a> DBRawIterator<'a> {
     ///         // There are no keys in the database
     ///     }
     /// }
-    /// let _ = DB::destroy(&Options::default(), path);
+    /// let _ = DBUtils::destroy(&Options::default(), path);
     /// ```
     pub fn seek_for_prev<K: AsRef<[u8]>>(&mut self, key: K) {
         let key = key.as_ref();
@@ -338,7 +325,7 @@ unsafe impl<'a> Sync for DBRawIterator<'a> {}
 /// ranges and direction.
 ///
 /// ```
-/// use rocksdb::{DB, Direction, IteratorMode, Options};
+/// use rocksdb::{prelude::*, Direction, IteratorMode};
 ///
 /// let path = "_path_for_rocksdb_storage2";
 /// {
@@ -363,7 +350,7 @@ unsafe impl<'a> Sync for DBRawIterator<'a> {}
 ///         println!("Saw {:?} {:?}", key, value);
 ///     }
 /// }
-/// let _ = DB::destroy(&Options::default(), path);
+/// let _ = DBUtils::destroy(&Options::default(), path);
 /// ```
 pub struct DBIterator<'a> {
     raw: DBRawIterator<'a>,
@@ -385,24 +372,9 @@ pub enum IteratorMode<'a> {
 }
 
 impl<'a> DBIterator<'a> {
-    pub(crate) fn new(db: &DB, readopts: ReadOptions, mode: IteratorMode) -> DBIterator<'a> {
+    pub(crate) fn new(raw: DBRawIterator<'a>, mode: IteratorMode) -> DBIterator<'a> {
         let mut rv = DBIterator {
-            raw: DBRawIterator::new(db, readopts),
-            direction: Direction::Forward, // blown away by set_mode()
-            just_seeked: false,
-        };
-        rv.set_mode(mode);
-        rv
-    }
-
-    pub(crate) fn new_cf(
-        db: &DB,
-        cf_handle: &ColumnFamily,
-        readopts: ReadOptions,
-        mode: IteratorMode,
-    ) -> DBIterator<'a> {
-        let mut rv = DBIterator {
-            raw: DBRawIterator::new_cf(db, cf_handle, readopts),
+            raw,
             direction: Direction::Forward, // blown away by set_mode()
             just_seeked: false,
         };

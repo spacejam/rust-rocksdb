@@ -19,10 +19,10 @@ use std::{mem, sync::Arc, thread, time::Duration};
 use pretty_assertions::assert_eq;
 
 use rocksdb::{
-    perf::get_memory_usage_stats, BlockBasedOptions, BottommostLevelCompaction, Cache,
-    CompactOptions, DBCompactionStyle, Env, Error, FifoCompactOptions, IteratorMode, Options,
-    PerfContext, PerfMetric, ReadOptions, SliceTransform, Snapshot, UniversalCompactOptions,
-    UniversalCompactionStopStyle, WriteBatch, DB,
+    perf::get_memory_usage_stats, prelude::*, BlockBasedOptions, BottommostLevelCompaction, Cache,
+    CompactOptions, DBCompactionStyle, DBWithTTL, Env, FifoCompactOptions, IteratorMode,
+    PerfContext, PerfMetric, ReadOnlyDB, SecondaryDB, SliceTransform, Snapshot,
+    UniversalCompactOptions, UniversalCompactionStopStyle, WriteBatch,
 };
 use util::DBPath;
 
@@ -68,7 +68,7 @@ fn errors_do_stuff() {
     let _db = DB::open_default(&path).unwrap();
     let opts = Options::default();
     // The DB will still be open when we try to destroy it and the lock should fail.
-    match DB::destroy(&opts, &path) {
+    match DBUtils::destroy(&opts, &path) {
         Err(s) => {
             let message = s.to_string();
             assert!(message.find("IO error:").is_some());
@@ -262,9 +262,15 @@ fn snapshot_test() {
     }
 }
 
+#[test]
+fn test_snapshot_outlive_db() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/fail/snapshot_outlive_db.rs");
+}
+
 #[derive(Clone)]
 struct SnapshotWrapper {
-    snapshot: Arc<Snapshot<'static>>,
+    snapshot: Arc<Snapshot<'static, DB>>,
 }
 
 impl SnapshotWrapper {
@@ -500,7 +506,7 @@ fn test_open_as_secondary() {
     opts.set_max_open_files(-1);
 
     let secondary_path = DBPath::new("_rust_rocksdb_test_open_as_secondary_secondary");
-    let secondary = DB::open_as_secondary(&opts, &primary_path, &secondary_path).unwrap();
+    let secondary = SecondaryDB::open(&opts, &primary_path, &secondary_path).unwrap();
 
     let result = secondary.get(b"key1").unwrap().unwrap();
     assert_eq!(get_byte_slice(&result), b"value1");
@@ -518,7 +524,7 @@ fn test_open_with_ttl() {
 
     let mut opts = Options::default();
     opts.create_if_missing(true);
-    let db = DB::open_with_ttl(&opts, &path, Duration::from_secs(1)).unwrap();
+    let db = DBWithTTL::open(&opts, &path, Duration::from_secs(1)).unwrap();
     db.put(b"key1", b"value1").unwrap();
 
     thread::sleep(Duration::from_secs(2));
@@ -814,9 +820,8 @@ fn test_open_for_read_only() {
     {
         let opts = Options::default();
         let error_if_log_file_exist = false;
-        let db = DB::open_for_read_only(&opts, &path, error_if_log_file_exist).unwrap();
+        let db = ReadOnlyDB::open(&opts, &path, error_if_log_file_exist).unwrap();
         assert_eq!(db.get(b"k1").unwrap().unwrap(), b"v1");
-        assert!(db.put(b"k2", b"v2").is_err());
     }
 }
 
@@ -835,10 +840,9 @@ fn test_open_cf_for_read_only() {
     {
         let opts = Options::default();
         let error_if_log_file_exist = false;
-        let db = DB::open_cf_for_read_only(&opts, &path, cfs, error_if_log_file_exist).unwrap();
+        let db = ReadOnlyDB::open_cf(&opts, &path, cfs, error_if_log_file_exist).unwrap();
         let cf1 = db.cf_handle("cf1").unwrap();
         assert_eq!(db.get_cf(cf1, b"k1").unwrap().unwrap(), b"v1");
-        assert!(db.put_cf(cf1, b"k2", b"v2").is_err());
     }
 }
 

@@ -26,6 +26,7 @@ zlib = ["librocksdb-sys/zlib"]
 bzip2 = ["librocksdb-sys/bzip2"]
 
 [dependencies]
+ambassador = "0.2"
 libc = "0.2"
 librocksdb-sys = { path = "librocksdb-sys", version = "6.17.3" }
 

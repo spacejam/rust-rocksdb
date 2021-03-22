@@ -16,7 +16,7 @@ mod util;
 
 use pretty_assertions::assert_eq;
 
-use rocksdb::{checkpoint::Checkpoint, Options, DB};
+use rocksdb::{checkpoint::Checkpoint, prelude::*};
 use util::DBPath;
 
 #[test]
@@ -98,4 +98,10 @@ pub fn test_multi_checkpoints() {
     assert_eq!(cp.get(b"k2").unwrap().unwrap(), b"changed");
     assert_eq!(cp.get(b"k5").unwrap().unwrap(), b"v5");
     assert_eq!(cp.get(b"k6").unwrap().unwrap(), b"v6");
+}
+
+#[test]
+fn test_checkpoint_outlive_db() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/fail/checkpoint_outlive_db.rs");
 }
